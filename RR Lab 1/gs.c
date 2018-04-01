@@ -18,7 +18,8 @@ float *xOld;
 /****** Function declarations */
 void check_matrix(); /* Check whether the matrix will converge */
 void get_input(char *);  /* Read input from file */
-float get_data(float *x, float ans, float *row, int my_i);
+void get_range(int comm_sz, int * length, int * displs);
+float get_data(float x[], float b, float row[], int my_i, int error[], int my_rank);
 /********************************/
 
 
@@ -135,6 +136,34 @@ void get_input(char filename[]) {
 }
 
 /******************************************************/
+/**
+ * This function will initialize two arrays that will contain the length and displacement of each process respectively
+ * @param comm_sz total number of processes
+ * @param length an array that will contain length per process
+ * @param displs an array that will contain displacement per process (for allgatherv)
+ */
+void get_range(int comm_sz, int * length, int * displs){
+    int numOfVals = num / comm_sz;
+    int rem = num % comm_sz;
+
+    //for loop, each process will need to do this because
+    //need the displacement and length of previous rank for displacement calculations
+    for (int i = 0; i < comm_sz; i++) {
+        if (i == 0) {
+            length[i] = numOfVals;
+            displs[i] = 0; //since this is the first block of array
+        } else {
+            length[i] = numOfVals;
+            //add on to end of last block so displacement is length of previous + their displacement
+            displs[i] = length[i - 1] + displs[i - 1];
+        }
+        //each process will receive an extra element until rem=0 and the last processes gets num/comm_sz
+        if (rem > 0) {
+            length[i]++;
+            rem--;
+        }
+    }
+}
 
 /**
  * This function calculates the new value of Xi using the global data given
@@ -142,9 +171,11 @@ void get_input(char filename[]) {
  * @param b the given solution of the equation from array b
  * @param row the row that is used to calculate x, ie: X1 would use first row a[1]
  * @param my_i the Xi that we want to find
+ * @param error array that contains if large error in any of the process' work
+ * @param error my_rank process number which error[my_rank] will update if there is an error
  * @return the updated value of Xi
  */
-float get_data(float x[], float b, float row[], int my_i) {
+float get_data(float x[], float b, float row[], int my_i, int error[], int my_rank) {
     float sum = 0;
 
     for (int i = 0; i < num; i++) {
@@ -154,26 +185,15 @@ float get_data(float x[], float b, float row[], int my_i) {
 //            printf("Summing up... %f\n", sum);
     }
 //        printf("calculating: %f - %f / %f", b, sum, row[my_i]);
-    return (b - sum) / row[my_i];
-}
 
-/**
- * This function checks for all new Xs, if it is within the given precision of error
- * @param x array with original values of Xs
- * @param newXs array with updated values of Xs
- * @return true if there are no errors
- */
-bool no_error(float *x, float *newXs) {
-    float newError;
-    for (int i = 0; i < num; i++) {
-        newError = fabsf((x[i] - newXs[i]) / newXs[i]);
-        if (newError > err) return false;
-    }
-    return true;
+    float newX=(b - sum) / row[my_i];
+    float newErr = fabsf((x[my_i] - newX) / newX);
+    if (newErr > err) error[my_rank]=0; //set back to false
+
+    return newX;
 }
 
 /************************************************************/
-
 
 int main(int argc, char *argv[]) {
     int nit = 0; /* number of iterations */
@@ -196,53 +216,46 @@ int main(int argc, char *argv[]) {
     MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
 
     bool finished = false; //will be used in while loop
-    int numPerProcess = num / comm_sz;
-    int rem = num % comm_sz;
-    int length[comm_sz];
+    int length[comm_sz]; //length of each process's array of X's
     int displs[comm_sz]; //for the sake of MPI_Allgatherv...
+    int error[comm_sz];
     float newXs[num]; //contains all new X's
 
-    //figure out how many elements will be in each process, and determine how much displacement there will be
-    //best in for-loop
-    for (int i = 0; i < comm_sz; i++) {
-        if (i == 0) {
-            length[i] = numPerProcess;
-            displs[i] = 0; //since this is the first block of arrays
-        } else {
-            length[i] = numPerProcess;
-            //add on to end of last block so displacement is length of previous + their displacement
-            displs[i] = length[i - 1] + displs[i - 1];
-        }
-        //each process will receive an extra element until the last processes gets num/comm_sz
-        if (rem != 0) {
-            length[i]++;
-            rem--;
-        }
-    }
+    //get range for each process and displacements for allgatherv
+    get_range(comm_sz, length, displs);
 
 //    printf("process %d will have length %d", my_rank, length[my_rank);
 
     //Each process's job per iteration:
-    //1. Calculate the new x
+    //1. Calculate the new x per amount of x's given to process
     //2. Concatenate each subarray into a new array of x's
     //3. Check if there is at least one error from any process, and if so we set back to false
     while (!finished) {
         nit++;
         finished = true; //reset every time so that we can check if all values in new X array is true
-        int subArrayStart = displs[my_rank]; //start index of the new X array
+        int subArrayStart = displs[my_rank]; //start index of the new X array for each process
+        error[my_rank]=1; //reset to true so that we can check if there's an error in calculation for new X's
         for (int i = 0; i < length[my_rank]; i++)
             //set the new X to calculated x, starting at displacement + i
-            newXs[subArrayStart + i] = get_data(x, b[subArrayStart + i], a[subArrayStart + i], subArrayStart + i);
+            newXs[subArrayStart + i] = get_data(x, b[subArrayStart + i], a[subArrayStart + i], subArrayStart + i, error, my_rank);
 
-
-        //allgather will collect in order of rank, have to do this before error check because working with individual subarrs
+        //allgather will collect subArrays in order of rank
+        //every iteration will sync here and each process will now have the
+        //new Xs they can check against -- hence no infinite loop/seg faults
         MPI_Allgatherv(&newXs[subArrayStart], length[my_rank], MPI_FLOAT, &newXs, length, displs, MPI_FLOAT,
                        MPI_COMM_WORLD);
 
-        //if one is false, all iterate once again
-        if (!no_error(x, newXs)) { finished = false; }
+        //gather a list of which contains bool per process
+        MPI_Allgather(&error[my_rank], 1, MPI_INT, &error, 1, MPI_INT, MPI_COMM_WORLD);
 
-        //set x to new x's, ok because global
+        for (int i=0; i < comm_sz; i++){ //will be always iterate maximum comm size per process per iteration
+            if (error[i]==0) {
+                finished=false;
+                break;
+            }
+        }
+
+        //set x to new x's
         for (int i = 0; i < num; i++) {
             x[i] = newXs[i];
         }
@@ -252,23 +265,20 @@ int main(int argc, char *argv[]) {
     MPI_Finalize();
 
     if (my_rank == 0) {
-//        /* Writing results to file */
-//        sprintf(output,"%d.sol",num);
-//        fp = fopen(output,"w");
-//        if(!fp)
-//        {
-//            printf("Cannot create the file %s\n", output);
-//            exit(1);
-//        }
-//
-//        for( i = 0; i < num; i++)
-//            fprintf(fp,"%f\n",x[i]);
+        /* Writing results to file */
+        sprintf(output,"%d.sol",num);
+        fp = fopen(output,"w");
+        if(!fp)
+        {
+            printf("Cannot create the file %s\n", output);
+            exit(1);
+        }
+
+        for(int i = 0; i < num; i++)
+            fprintf(fp,"%f\n",x[i]);
 
         printf("total number of iterations: %d\n", nit);
-        for (int i = 0; i < num; i++) {
-            printf("x is %f\n", x[i]);
-        }
-//        fclose(fp);
+        fclose(fp);
         printf("\n");
     }
 
